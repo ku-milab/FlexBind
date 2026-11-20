@@ -21,7 +21,7 @@ To fully satisfy requirements for generalization, experimental validity, and met
 ## Installation
 
 ```bash
-conda env create -f environment.yml
+conda env create -f environment.yaml
 conda activate flexbind
 ```
 
