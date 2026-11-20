@@ -1,419 +1,244 @@
-import os
-import sys
+"""Training / evaluation of FlexBind (Sections "Training Objective" and "Experimental Settings").
+
+* frozen ProtT5 embeddings (precomputed .npz), full-length sequences, dynamic padding
+* AdamW (lr 1e-4, weight decay 0.01), batch size 32
+* task-specific asymmetric focal loss + uncertainty-based task weighting (sigma_t init 1)
+* early stopping / checkpoint selection on validation AUPR (mean over the four tasks), patience 10
+* operating thresholds = F1-maximising thresholds on the validation set
+* repeated over independent random seeds (10 by default) → mean ± SD
+
+Example:
+    python scripts/train.py --config configs/default_config.yaml --name DP81 \
+        --npz_path data/processed/DP81/train_val.npz --test_npz_path data/processed/DP81/test.npz \
+        --disorder_txt ... --protein_txt ... --rna_txt ... --dna_txt ... \
+        --test_disorder_txt ... --test_protein_txt ... --test_rna_txt ... --test_dna_txt ...
+"""
 import argparse
-from typing import Dict, List, Tuple, Optional
+import copy
+import json
+import os
+import random
+import sys
+import time
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+import yaml
 from tqdm.auto import tqdm
 
-# Add parent directory to python path to import models and scripts modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.flexbind import IDRModel
-from scripts.evaluate import evaluate, plot_roc_pr_curves, masked_bce_with_logits, focal_bce_with_logits, dice_loss
+from models.flexbind import FlexBind  # noqa: E402
+from models.layers import HAS_MAMBA_SSM  # noqa: E402
+from models.losses import UncertaintyWeightedLoss, asymmetric_focal_loss  # noqa: E402
+from scripts.dataset import TASKS, build_loader, load_npz_ids, log, split_ids  # noqa: E402
+from scripts.evaluate import (METRIC_NAMES, collect_predictions, evaluate_predictions,  # noqa: E402
+                              format_table, mean_aupr, plot_pr_curves, save_predictions,
+                              select_thresholds)
 
-def log(s: str):
-    print(f'[LOG] {s}')
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "configs", "default_config.yaml")
 
-def set_seed(seed: int = 42):
-    import random
+
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-def make_ids(npz_ids):
-    n = len(npz_ids)
-    train_ids = [npz_ids[i] for i in range(n)]
-    return train_ids
 
-def split_ids(npz_ids, val_ratio=0.1, seed=42):
-    rng = np.random.RandomState(seed)
-    idx = np.arange(len(npz_ids))
-    rng.shuffle(idx)
+def load_config(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-    n_val = int(len(npz_ids) * val_ratio)
-    if n_val == 0 and len(npz_ids) > 1:
-        n_val = 1
 
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
-
-    train_ids = [npz_ids[i] for i in train_idx]
-    val_ids = [npz_ids[i] for i in val_idx]
-
-    return train_ids, val_ids
-
-def parse_thresholds(s: str, default=0.5):
-    names = ['disorder', 'protein', 'rna', 'dna']
-    out = {k: default for k in names}
-
-    if not s:
-        return out
-    for tok in s.split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        k, v = tok.split('=', 1)
-        k = k.strip().lower()
-        v = float(v.strip())
-        if k in out:
-            out[k] = v
-    return out
-
-class IDREmbDataset(Dataset):
-    def __init__(
-        self,
-        npz_path: str,
-        label_files: Dict[str, str],
-        id_key: str = "ids",
-        per_res_key: str = "per_residue",
-        max_len: Optional[int] = None,
-        include_ids: Optional[set] = None,
-    ):
-        super().__init__()
-        self.npz = np.load(npz_path, allow_pickle=True)
-        self.ids: List[str] = list(map(str, self.npz[id_key]))
-        self.per_residue = list(self.npz[per_res_key])
-        self.dim = int(self.npz.get('dim', self.per_residue[0].shape[-1]))
-        self.max_len = max_len
-        self.include_ids = set(include_ids) if include_ids is not None else None
-
-        self.tasks = ['disorder', 'protein', 'rna', 'dna']
-        for t in self.tasks:
-            if t not in label_files:
-                raise ValueError(f"Missing label file for task '{t}'. Provided keys: {list(label_files.keys())}")
-
-        self.label_maps: Dict[str, Dict[str, np.ndarray]] = {
-            t: self._load_label_txt(label_files[t]) for t in self.tasks
-        }
-
-        self.id_to_rawidx = {sid: i for i, sid in enumerate(self.ids)}
-
-        self.valid_indices: List[int] = []
-        dropped: List[Tuple[str, int, Dict[str, int]]] = []
-
-        for i, sid in enumerate(self.ids):
-            if self.include_ids is not None and sid not in self.include_ids:
-                continue
-
-            L = self.per_residue[i].shape[0]
-            ok = True
-            mis = {}
-
-            for t in self.tasks:
-                arr = self.label_maps[t].get(sid)
-                if arr is None:
-                    ok = False
-                    mis[t] = -1
-                elif len(arr) != L:
-                    ok = False
-                    mis[t] = len(arr)
-
-            if ok:
-                self.valid_indices.append(i)
-            else:
-                dropped.append((sid, L, mis))
-
-        if dropped:
-            log(f'Dropped {len(dropped)} sequences with missing/length-mismatched labels (showing up to 30): {dropped[:30]}')
-        log(f'Dataset ready. kept={len(self.valid_indices)} / total={len(self.ids)}, dim={self.dim}')
-
-    @staticmethod
-    def _parse_label_line(line: str) -> Optional[List[int]]:
-        line = line.strip()
-        if not line:
-            return None
-        if set(line) <= set("01") and len(line) > 1:
-            return [int(c) for c in line]
-        else:
-            return None
-
-    def _load_label_txt(self, path: str) -> Dict[str, np.ndarray]:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f'label file not found: {path}')
-        mp: Dict[str, np.ndarray] = {}
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = [ln.rstrip('\n') for ln in f]
-        for ln in lines:
-            if not ln.strip():
-                continue
-            sid, payload = ln.split('\t', 1)
-            arr = self._parse_label_line(payload)
-            if arr is None:
-                raise ValueError(f'Could not parse labels in TSV line: {ln}')
-            mp[sid] = np.asarray(arr, dtype=np.int64)
-        return mp
-
-    def __len__(self) -> int:
-        return len(self.valid_indices)
-
-    def __getitem__(self, idx: int):
-        i = self.valid_indices[idx]
-        sid = self.ids[i]
-        H = self.per_residue[i].astype(np.float32)
-        L, d = H.shape
-
-        y = np.zeros((L, 4), dtype=np.float32)
-        for j, t in enumerate(self.tasks):
-            y[:, j] = self.label_maps[t][sid].astype(np.float32)
-
-        if self.max_len and L > self.max_len:
-            start = (L - self.max_len) // 2
-            H = H[start:start + self.max_len]
-            y = y[start:start + self.max_len]
-            L = self.max_len
-
-        return {
-            "id": sid,
-            "emb": torch.from_numpy(H),
-            "label": torch.from_numpy(y),
-            "len": L,
-        }
-
-def collate_pad(batch: List[dict]):
-    Ls = [b["len"] for b in batch]
-    Lmax = max(Ls)
-    d = batch[0]['emb'].shape[-1]
-    B = len(batch)
-
-    emb = torch.zeros(B, Lmax, d, dtype=torch.float32)
-    lab = torch.full((B, Lmax, 4), fill_value=-100.0, dtype=torch.float32)
-    mask = torch.zeros(B, Lmax, dtype=torch.bool)
-    ids = []
-
-    for i, b in enumerate(batch):
-        L = b["len"]
-        emb[i, :L] = b['emb']
-        lab[i, :L] = b['label']
-        mask[i, :L] = True
-        ids.append(b['id'])
-
-    return {'ids': ids, 'emb': emb, 'label': lab, 'mask': mask}
-
-def build_loader(cfg, use_ids=None, test_flag=None):
-    if test_flag is None:
-        npz = np.load(cfg.npz_path, allow_pickle=True)
-    else:
-        npz = np.load(cfg.test_npz_path, allow_pickle=True)
-
-    ids = [str(x) for x in npz['ids']]
-
-    selected_ids = list(ids)
-    if use_ids is not None:
-        wanted = set(use_ids)
-        selected_ids = [sid for sid in ids if sid in wanted]
-
-    if test_flag is None:
-        ds = IDREmbDataset(
-            npz_path=cfg.npz_path,
-            label_files={
-                "disorder": cfg.disorder_txt,
-                "protein": cfg.protein_txt,
-                "rna": cfg.rna_txt,
-                "dna": cfg.dna_txt,
-            },
-            max_len=cfg.max_len,
-            include_ids=set(selected_ids)
-        )
-        return DataLoader(
-            ds,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=2,
-            collate_fn=collate_pad,
-            pin_memory=True
-        )
-    else:
-        ds = IDREmbDataset(
-            npz_path=cfg.test_npz_path,
-            label_files={
-                "disorder": cfg.test_disorder_txt,
-                "protein": cfg.test_protein_txt,
-                "rna": cfg.test_rna_txt,
-                "dna": cfg.test_dna_txt,
-            },
-            max_len=cfg.max_len,
-            include_ids=set(selected_ids)
-        )
-        return DataLoader(
-            ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=2,
-            collate_fn=collate_pad,
-            pin_memory=True
-        )
-
-def train_one_epoch(model, loader, optimizer, cfg, epoch: int):
+def train_one_epoch(model, criterion, loader, optimizer, cfg, device, epoch):
     model.train()
-    total = 0.0
-
-    pbar = tqdm(loader, desc=f'Train Epoch {epoch}', leave=False)
-    for step, batch in enumerate(pbar):
-        H = batch['emb'].to(cfg.device)
-        Y = batch['label'].to(cfg.device)
-        M = batch['mask'].to(cfg.device)
+    criterion.train()
+    gp, gn = cfg["loss"]["gamma_pos"], cfg["loss"]["gamma_neg"]
+    total, n = 0.0, 0
+    pbar = tqdm(loader, desc=f"Train epoch {epoch}", leave=False)
+    for batch in pbar:
+        H = batch["emb"].to(device, non_blocking=True)
+        Y = batch["label"].to(device, non_blocking=True)
+        M = batch["mask"].to(device, non_blocking=True)
 
         logits = model(H, M)
-        loss_sum = 0.0
-        names = ['disorder', 'protein', 'rna', 'dna']
-
-        task_weights = {
-            "disorder": 1.0,
-            "protein": 2.43,
-            "rna": 27.61,
-            "dna": 17.63,
-        }
-
-        pos_weight_map = {
-            "disorder": torch.tensor(3.51, device=cfg.device),
-            "protein": torch.tensor(9.98, device=cfg.device),
-            "rna": torch.tensor(123.63, device=cfg.device),
-            "dna": torch.tensor(78.59, device=cfg.device),
-        }
-
-        for j, name in enumerate(names):
-            y = Y[:, :, j]
-            mask = M & (y > -50)
-
-            pw = pos_weight_map[name]
-            l = masked_bce_with_logits(logits[name], y, mask, pos_weight=pw)
-
-            if cfg.use_focal:
-                l = l + focal_bce_with_logits(logits[name], y, mask, alpha=cfg.alphas[name])
-            if cfg.use_dice:
-                l = l + dice_loss(logits[name], y, mask)
-
-            task_w = task_weights[name]
-            loss_sum = loss_sum + l * task_w
+        task_losses = {}
+        for j, t in enumerate(TASKS):
+            valid = M & (Y[:, :, j] > -50)        # padded / unlabelled residues excluded
+            task_losses[t] = asymmetric_focal_loss(logits[t], Y[:, :, j], valid, gp[t], gn[t])
+        loss = criterion(task_losses)
 
         optimizer.zero_grad(set_to_none=True)
-        loss_sum.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        loss.backward()
+        if cfg["optim"].get("grad_clip"):
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()),
+                                           cfg["optim"]["grad_clip"])
         optimizer.step()
 
-        total += loss_sum.item()
-        pbar.set_postfix(loss=f"{(total / (step + 1)):.4f}")
+        total += loss.item()
+        n += 1
+        pbar.set_postfix(loss=f"{total / n:.4f}")
+    return total / max(n, 1)
 
-    return total / max(len(loader), 1)
+
+def run_seed(seed, cfg, args, device, loaders):
+    train_loader, val_loader, test_loader = loaders
+    set_seed(seed)
+    out_dir = os.path.join(args.out_dir, args.name, f"seed{seed}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    model = FlexBind(**cfg["model"]).to(device)
+    criterion = UncertaintyWeightedLoss(TASKS, init_sigma=cfg["loss"]["init_sigma"]).to(device)
+    # Uncertainty parameters are excluded from weight decay (decay would bias sigma_t toward 1).
+    optimizer = torch.optim.AdamW([
+        {"params": model.parameters(), "weight_decay": cfg["optim"]["weight_decay"]},
+        {"params": criterion.parameters(), "weight_decay": 0.0},
+    ], lr=cfg["optim"]["lr"])
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log(f"[seed {seed}] trainable parameters: {n_params / 1e6:.2f}M | fused Mamba kernel: "
+        f"{HAS_MAMBA_SSM and device == 'cuda'}")
+
+    best_path = os.path.join(out_dir, "best.pt")
+    best_aupr, best_epoch, patience_left = -np.inf, 0, cfg["optim"]["patience"]
+    history = []
+    for epoch in range(1, cfg["optim"]["max_epochs"] + 1):
+        t0 = time.time()
+        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, cfg, device, epoch)
+        val_preds, val_losses = collect_predictions(model, val_loader, device, gammas=cfg["loss"])
+        val_aupr = mean_aupr(val_preds)
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_mean_aupr": val_aupr,
+                        "val_task_loss": val_losses, "sigma": criterion.sigmas()})
+        log(f"[seed {seed}] epoch {epoch:3d} | train_loss {train_loss:.4f} | val mean AUPR {val_aupr:.4f} "
+            f"| sigma {criterion.sigmas()} | {time.time() - t0:.0f}s")
+
+        if np.isfinite(val_aupr) and val_aupr > best_aupr:
+            best_aupr, best_epoch, patience_left = val_aupr, epoch, cfg["optim"]["patience"]
+            torch.save({"model_state": model.state_dict(), "loss_state": criterion.state_dict(),
+                        "model_config": model.config, "epoch": epoch, "seed": seed,
+                        "val_mean_aupr": val_aupr}, best_path)
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                log(f"[seed {seed}] early stopping at epoch {epoch} (best epoch {best_epoch})")
+                break
+
+    # ---- reload best checkpoint, fix thresholds on validation, evaluate on test ----
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    val_preds, _ = collect_predictions(model, val_loader, device)
+    thresholds = select_thresholds(val_preds)
+    ckpt["thresholds"] = thresholds
+    torch.save(ckpt, best_path)
+
+    test_preds, _ = collect_predictions(model, test_loader, device)
+    test_metrics = evaluate_predictions(test_preds, thresholds)
+    save_predictions(test_preds, thresholds, os.path.join(out_dir, "test_predictions.pkl"))
+    if args.plot:
+        plot_pr_curves(test_preds, out_dir, suffix="_test")
+
+    result = {"seed": seed, "best_epoch": best_epoch, "val_mean_aupr": best_aupr,
+              "thresholds": thresholds, "test": test_metrics, "history": history}
+    with open(os.path.join(out_dir, "results.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    log(f"[seed {seed}] TEST (thresholds from validation: {thresholds})\n{format_table(test_metrics)}")
+    return result
+
+
+def summarize(results, path):
+    summary = {}
+    for t in TASKS:
+        summary[t] = {}
+        for m in METRIC_NAMES:
+            vals = np.array([r["test"][t][m] for r in results], dtype=np.float64)
+            summary[t][m] = {"mean": float(np.nanmean(vals)),
+                             "sd": float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0,
+                             "values": vals.tolist()}
+    with open(path, "w") as f:
+        json.dump({"seeds": [r["seed"] for r in results], "summary": summary}, f, indent=2)
+    lines = ["task      " + "".join(f"{m:>18}" for m in METRIC_NAMES)]
+    for t in TASKS:
+        lines.append(f"{t:<10}" + "".join(
+            f"{summary[t][m]['mean']:>10.4f}±{summary[t][m]['sd']:<7.4f}" for m in METRIC_NAMES))
+    return "\n".join(lines)
+
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--npz_path', required=True)
-    p.add_argument('--test_npz_path', required=True)
-    p.add_argument('--disorder_txt', required=True)
-    p.add_argument('--protein_txt', required=True)
-    p.add_argument('--rna_txt', required=True)
-    p.add_argument('--dna_txt', required=True)
-    p.add_argument('--test_disorder_txt', required=True)
-    p.add_argument('--test_protein_txt', required=True)
-    p.add_argument('--test_rna_txt', required=True)
-    p.add_argument('--test_dna_txt', required=True)
-    p.add_argument('--out_dir', default='./checkpoints')
-    p.add_argument('--batch_size', type=int, default=3)
-    p.add_argument('--max_epochs', type=int, default=5)
-    p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--weight_decay', type=float, default=1e-4)
-    p.add_argument('--grad_clip', type=float, default=1.0)
-    p.add_argument('--max_len', type=int, default=0, help='optional crop length (0=no crop)')
-    p.add_argument('--no_focal', action='store_true')
-    p.add_argument('--no_dice', action='store_true')
-    p.add_argument('--seed', type=int, default=1234)
-    p.add_argument('--val_ratio', type=float, default=0.1)
-    p.add_argument('--thresholds', type=str, default=None)
-    p.add_argument('--alphas', type=str, default=None)
+    p.add_argument("--config", default=DEFAULT_CONFIG)
+    p.add_argument("--name", default="run", help="experiment name, e.g. DP81 / DP93")
+    p.add_argument("--npz_path", required=True, help="training (or train+validation) embeddings")
+    p.add_argument("--test_npz_path", required=True)
+    p.add_argument("--disorder_txt", required=True)
+    p.add_argument("--protein_txt", required=True)
+    p.add_argument("--rna_txt", required=True)
+    p.add_argument("--dna_txt", required=True)
+    p.add_argument("--test_disorder_txt", required=True)
+    p.add_argument("--test_protein_txt", required=True)
+    p.add_argument("--test_rna_txt", required=True)
+    p.add_argument("--test_dna_txt", required=True)
+    # Optional explicit validation set (benchmark-defined split). If omitted, a fixed random
+    # split of --npz_path (val_ratio, split_seed) is used, identical for every model seed.
+    p.add_argument("--val_npz_path", default=None)
+    p.add_argument("--val_disorder_txt", default=None)
+    p.add_argument("--val_protein_txt", default=None)
+    p.add_argument("--val_rna_txt", default=None)
+    p.add_argument("--val_dna_txt", default=None)
+    p.add_argument("--out_dir", default="./checkpoints")
+    p.add_argument("--seeds", type=int, nargs="+", default=None, help="override the seeds in the config")
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--max_epochs", type=int, default=None)
+    p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--plot", action="store_true")
     args = p.parse_args()
 
-    class c: pass
-    cfg = c()
-    cfg.npz_path = args.npz_path
-    cfg.test_npz_path = args.test_npz_path
-    cfg.disorder_txt = args.disorder_txt
-    cfg.protein_txt = args.protein_txt
-    cfg.rna_txt = args.rna_txt
-    cfg.dna_txt = args.dna_txt
-    cfg.test_disorder_txt = args.test_disorder_txt
-    cfg.test_protein_txt = args.test_protein_txt
-    cfg.test_rna_txt = args.test_rna_txt
-    cfg.test_dna_txt = args.test_dna_txt
-    cfg.out_dir = args.out_dir
-    cfg.batch_size = args.batch_size
-    cfg.max_epochs = args.max_epochs
-    cfg.lr = args.lr
-    cfg.weight_decay = args.weight_decay
-    cfg.grad_clip = args.grad_clip
-    cfg.max_len = None if args.max_len in (0, None) else int(args.max_len)
-    cfg.use_focal = not args.no_focal
-    cfg.use_dice = not args.no_dice
-    cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    cfg.thresholds = parse_thresholds(args.thresholds, default=0.5)
-    cfg.alphas = parse_thresholds(args.alphas, default=0.5)
-    cfg.seed = args.seed
-    cfg.val_ratio = args.val_ratio
+    cfg = copy.deepcopy(load_config(args.config))
+    for k in ["lr", "weight_decay", "batch_size", "max_epochs", "patience"]:
+        if getattr(args, k) is not None:
+            cfg["optim"][k] = getattr(args, k)
+    seeds = args.seeds or cfg["random_seeds"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log(f"device={device} | seeds={seeds} | optim={cfg['optim']}")
 
-    log(f'Using thresholds: {cfg.thresholds}')
-    log(f'Using alphas: {cfg.alphas}')
-    log(f'Using device: {cfg.device}')
+    os.makedirs(os.path.join(args.out_dir, args.name), exist_ok=True)
+    with open(os.path.join(args.out_dir, args.name, "config_used.yaml"), "w") as f:
+        yaml.safe_dump({**cfg, "random_seeds": seeds, "args": vars(args)}, f)
 
-    set_seed(cfg.seed)
+    labels = {"disorder": args.disorder_txt, "protein": args.protein_txt,
+              "rna": args.rna_txt, "dna": args.dna_txt}
+    test_labels = {"disorder": args.test_disorder_txt, "protein": args.test_protein_txt,
+                   "rna": args.test_rna_txt, "dna": args.test_dna_txt}
+    bs, nw = cfg["optim"]["batch_size"], cfg.get("num_workers", 2)
 
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    best_ckpt_dir = os.path.join(cfg.out_dir, 'DP93')
-    os.makedirs(best_ckpt_dir, exist_ok=True)
+    if args.val_npz_path:
+        val_labels = {"disorder": args.val_disorder_txt, "protein": args.val_protein_txt,
+                      "rna": args.val_rna_txt, "dna": args.val_dna_txt}
+        if any(v is None for v in val_labels.values()):
+            p.error("--val_npz_path requires all four --val_*_txt label files")
+        train_ids, val_npz, val_ids = None, args.val_npz_path, None
+    else:
+        train_ids, val_ids = split_ids(load_npz_ids(args.npz_path), cfg["val_ratio"], cfg["split_seed"])
+        val_npz, val_labels = args.npz_path, labels
+        log(f"Random train/val split (split_seed={cfg['split_seed']}): train={len(train_ids)}, val={len(val_ids)}")
 
-    npz = np.load(cfg.npz_path, allow_pickle=True)
-    npz_ids = [str(x) for x in npz['ids']]
+    results = []
+    for seed in seeds:
+        loaders = (
+            build_loader(args.npz_path, labels, bs, shuffle=True, include_ids=train_ids, num_workers=nw, seed=seed),
+            build_loader(val_npz, val_labels, bs, shuffle=False, include_ids=val_ids, num_workers=nw),
+            build_loader(args.test_npz_path, test_labels, bs, shuffle=False, num_workers=nw),
+        )
+        results.append(run_seed(seed, cfg, args, device, loaders))
 
-    test_npz = np.load(cfg.test_npz_path, allow_pickle=True)
-    test_npz_ids = [str(x) for x in test_npz['ids']]
+    table = summarize(results, os.path.join(args.out_dir, args.name, "summary.json"))
+    log(f"TEST over {len(results)} seed(s), mean ± SD:\n{table}")
 
-    train_ids, val_ids = split_ids(npz_ids, val_ratio=cfg.val_ratio, seed=cfg.seed)
-    test_ids = make_ids(test_npz_ids)
 
-    log(f"Train size: {len(train_ids)}")
-    log(f"Val size:   {len(val_ids)}")
-    log(f"Test size:  {len(test_ids)}")
-
-    train_loader = build_loader(cfg, use_ids=train_ids)
-    val_loader = build_loader(cfg, use_ids=val_ids)
-    test_loader = build_loader(cfg, use_ids=test_ids, test_flag=1)
-
-    sample = next(iter(train_loader))
-    d = sample['emb'].shape[-1]
-
-    model = IDRModel(d=d).to(cfg.device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    best_val_f1 = -1.0
-    best_val_metrics = None
-    best_model_path = os.path.join(best_ckpt_dir, 'disorder_best.pt')
-
-    for ep in tqdm(range(1, cfg.max_epochs + 1), desc="Epochs"):
-        train_loss = train_one_epoch(model, train_loader, opt, cfg, ep)
-        val_metrics = evaluate(model, val_loader, cfg)
-        best_f1_per_task = plot_roc_pr_curves(val_metrics, cfg.out_dir, suffix=f"_val_epoch{ep}")
-
-        disorder_f1 = best_f1_per_task[0]
-
-        if np.isfinite(disorder_f1) and disorder_f1 > best_val_f1:
-            best_val_f1 = disorder_f1
-            best_val_metrics = val_metrics
-            torch.save(model.state_dict(), best_model_path)
-            print(f"[BEST] Updated VAL disorder best-F1 = {best_val_f1:.4f} at epoch {ep}")
-
-        log(f"[epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_metrics['loss']:.4f}")
-
-    if best_val_metrics is not None:
-        plot_roc_pr_curves(best_val_metrics, cfg.out_dir, suffix='_val_best')
-
-    if os.path.isfile(best_model_path):
-        model.load_state_dict(torch.load(best_model_path, map_location=cfg.device))
-
-    test_metrics = evaluate(model, test_loader, cfg)
-    plot_roc_pr_curves(test_metrics, cfg.out_dir, suffix='_test')
-    log(f"[FINAL TEST] loss={test_metrics['loss']:.4f}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
