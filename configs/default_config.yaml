@@ -1,18 +1,42 @@
-# 10 Independent Random Seeds for Experimental Validity
+# FlexBind default configuration (values follow "Experimental Settings" of the paper)
+
+# 10 independent random seeds (results reported as mean ± SD)
 random_seeds: [42, 1234, 2023, 2024, 777, 888, 999, 1111, 2222, 3333]
 
-# Model Hyperparameters
-learning_rate: 0.0001
-weight_decay: 0.01
-batch_size: 32
-max_epochs: 100
-grad_clip: 1.0
+# Used only when no explicit validation set is given: fixed random split of the training npz,
+# identical for every model seed.
+split_seed: 42
 val_ratio: 0.1
-device: "cuda"
+num_workers: 2
 
-# Multi-task Loss Weights
-task_weights:
-  disorder: 1.0
-  protein: 2.43
-  rna: 27.61
-  dna: 17.63
+model:
+  d_plm: 1024                       # d1: ProtT5 embedding dimensionality (frozen encoder)
+  d2: 128                           # projected channel dimensionality
+  scales: [1, 3, 4, 5, 8, 16, 32]   # 7 CWT scales (~5–160 residue contexts)
+  kernel_size: 5                    # wavelet support = kernel_size × scale residues
+  omega0: 6.0                       # complex Morlet centre frequency (not given in the paper; standard value)
+  n_mamba: 3                        # M Mamba blocks per task branch, hidden dim = d_plm = 1024
+  d_state: 16                       # Mamba defaults (not given in the paper)
+  d_conv: 4
+  expand: 2
+  head_hidden: 256                  # MLP head (width not given in the paper)
+  dropout: 0.1
+  use_fused_kernel: true            # use mamba_ssm CUDA kernel if installed
+
+loss:
+  # task-specific asymmetric focal loss
+  gamma_pos: {disorder: 0, protein: 0, rna: 0, dna: 0}
+  gamma_neg: {disorder: 2, protein: 2, rna: 3, dna: 3}
+  init_sigma: 1.0                   # uncertainty-based task weighting, sigma_t initialised to 1
+
+optim:
+  lr: 0.0001
+  weight_decay: 0.01
+  batch_size: 32
+  max_epochs: 100
+  patience: 10                      # early stopping on validation AUPR (mean over the four tasks)
+  grad_clip: 1.0
+
+bootstrap:
+  n_iter: 1000
+  alpha: 0.05

@@ -1,184 +1,239 @@
+"""Evaluation utilities and CLI.
+
+Metrics (all micro-averaged, i.e. residues pooled over all test proteins):
+    AUPR, F1max, AUROC  — threshold-free (threshold sweep)
+    Precision, Recall, MCC — at a pre-specified operating point: the threshold that maximised
+                             F1 on the *validation* set (no test data used for threshold tuning).
+
+CLI example (evaluate a trained checkpoint on another test set, e.g. DP94 with the DP93 model):
+    python scripts/evaluate.py --checkpoint checkpoints/DP93/seed42/best.pt \
+        --npz_path data/processed/DP94/test.npz \
+        --disorder_txt ... --protein_txt ... --rna_txt ... --dna_txt ... \
+        --out_dir results/DP94_seed42
+"""
+import argparse
+import json
+import os
+import pickle
+import sys
+from typing import Dict, Optional, Sequence
+
 import numpy as np
 import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, auc
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 
-TASK_NAMES = ['disorder', 'protein', 'rna', 'dna']
-BINDING_IDX = [1, 2, 3]  # macro/micro 집계 대상 (disorder 제외)
-NAN = float('nan')
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from models.flexbind import FlexBind  # noqa: E402
+from models.losses import asymmetric_focal_loss  # noqa: E402
+from scripts.dataset import TASKS, build_loader, log  # noqa: E402
 
-# --------------------------------------------------------------------------- #
-# Losses
-# --------------------------------------------------------------------------- #
-def masked_bce_with_logits(logits, targets, mask, pos_weight=None):
-    return F.binary_cross_entropy_with_logits(logits[mask], targets[mask], pos_weight=pos_weight)
-
-
-def focal_bce_with_logits(logits, targets, mask, gamma=2.0, alpha=0.75):
-    logits, targets = logits[mask], targets[mask]
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    p = torch.sigmoid(logits)
-    pt = targets * p + (1 - targets) * (1 - p)
-    alpha_t = targets * alpha + (1 - targets) * (1 - alpha)
-    return (alpha_t * (1 - pt) ** gamma * bce).mean()
-
-
-def dice_loss(logits, targets, mask, eps=1e-6):
-    probs, targets = torch.sigmoid(logits)[mask], targets[mask]
-    inter = (probs * targets).sum()
-    return 1 - (2 * inter + eps) / (probs.sum() + targets.sum() + eps)
+NAN = float("nan")
+METRIC_NAMES = ["AUPR", "F1max", "AUROC", "Precision", "Recall", "MCC"]
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Metrics
 # --------------------------------------------------------------------------- #
-def _best_f1(P, R, TH):
-    """PR 곡선에서 F1이 최대인 지점의 (f1, threshold, precision, recall)."""
-    # P[i], R[i]가 TH[i]에 대응. 마지막 점 (P=1, R=0)은 threshold가 없으므로 제외.
-    f1 = 2 * P[:-1] * R[:-1] / (P[:-1] + R[:-1] + 1e-12)
-    i = int(np.argmax(f1))
-    return float(f1[i]), float(TH[i]), float(P[i]), float(R[i])
-
-
-def _has_both_classes(y_true):
+def _has_both_classes(y_true: np.ndarray) -> bool:
     return len(y_true) > 0 and y_true.min() != y_true.max()
 
 
+def best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray):
+    """Returns (F1max, threshold) from a full threshold sweep."""
+    if not _has_both_classes(y_true):
+        return NAN, 0.5
+    P, R, TH = precision_recall_curve(y_true, y_prob)
+    f1 = 2 * P[:-1] * R[:-1] / (P[:-1] + R[:-1] + 1e-12)   # last point (P=1, R=0) has no threshold
+    i = int(np.nanargmax(f1))
+    return float(f1[i]), float(TH[i])
+
+
+def binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    pred = (y_prob >= threshold).astype(np.int64)
+    y = y_true.astype(np.int64)
+    tp = float(np.sum((pred == 1) & (y == 1)))
+    fp = float(np.sum((pred == 1) & (y == 0)))
+    fn = float(np.sum((pred == 0) & (y == 1)))
+    tn = float(np.sum((pred == 0) & (y == 0)))
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    denom = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = (tp * tn - fp * fn) / denom if denom > 0 else 0.0
+    return {"Precision": precision, "Recall": recall, "MCC": float(mcc),
+            "TP": tp, "FP": fp, "FN": fn, "TN": tn}
+
+
+def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    out = {"n_residues": int(len(y_true)), "n_positive": int(np.sum(y_true)), "threshold": float(threshold)}
+    if _has_both_classes(y_true):
+        out["AUPR"] = float(average_precision_score(y_true, y_prob))
+        out["AUROC"] = float(roc_auc_score(y_true, y_prob))
+        out["F1max"] = best_f1_threshold(y_true, y_prob)[0]
+    else:
+        out["AUPR"] = out["AUROC"] = out["F1max"] = NAN
+    out.update(binary_metrics(y_true, y_prob, threshold))
+    return out
+
+
 # --------------------------------------------------------------------------- #
-# Plot
-# --------------------------------------------------------------------------- #
-def plot_roc_pr_curves(metrics, out_dir, suffix=""):
-    """태스크별 PR 곡선을 저장하고 best F1 리스트를 반환."""
-    best_f1_per_task = []
-
-    for t, name in enumerate(TASK_NAMES):
-        y_true = metrics['roc_raw']['y_true'][t]
-        y_prob = metrics['roc_raw']['y_prob'][t]
-
-        if not _has_both_classes(y_true):
-            print(f"[WARN] Cannot plot PR for task {name} (no positive or negative examples)")
-            best_f1_per_task.append(NAN)
-            continue
-
-        P, R, TH = precision_recall_curve(y_true, y_prob)
-        best_f1, best_th, best_p, best_r = _best_f1(P, R, TH)
-
-        plt.figure(figsize=(5, 5))
-        plt.plot(R, P, label=f"AUC={metrics['auc'][t]:.4f}, AUPR={auc(R, P):.4f}, "
-                             f"F1={best_f1:.4f}, Rec={best_r:.4f}")
-        plt.scatter(best_r, best_p, color='red', s=40, label=f"Best-F1@th={best_th:.3f}")
-        plt.xlabel("Recall")
-        plt.ylabel("Precision")
-        plt.title(f"PR Curve - {name}")
-        plt.legend(loc="upper right")
-        plt.tight_layout()
-        plt.savefig(f"{out_dir}/pr_{name}{suffix}.png", dpi=200)
-        plt.close()
-
-        print(f"[PLOT] Saved PR curve for '{name}{suffix}' (Best F1={best_f1:.4f})")
-        best_f1_per_task.append(best_f1)
-
-    return best_f1_per_task
-
-
-# --------------------------------------------------------------------------- #
-# Evaluation
+# Predictions
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(model, loader, cfg):
+def collect_predictions(model, loader, device, gammas: Optional[Dict[str, Dict[str, float]]] = None):
+    """Runs the model and returns per-protein predictions (+ mean per-task ASL if `gammas`).
+
+    preds = {"tasks": [...], "proteins": {id: {"prob": (L, T) float32, "label": (L, T) int8}}}
+    """
     model.eval()
-    n_tasks = len(TASK_NAMES)
-
-    total_loss, nsteps = 0.0, 0
-    tp, tn, fp, fn = (torch.zeros(n_tasks, device=cfg.device) for _ in range(4))
-    y_true_all = [[] for _ in range(n_tasks)]
-    y_prob_all = [[] for _ in range(n_tasks)]
-
+    proteins = {}
+    loss_sums = {t: 0.0 for t in TASKS}
+    n_batches = 0
     for batch in loader:
-        H = batch['emb'].to(cfg.device)
-        Y = batch['label'].to(cfg.device)
-        M = batch['mask'].to(cfg.device)
+        H = batch["emb"].to(device, non_blocking=True)
+        Y = batch["label"].to(device, non_blocking=True)
+        M = batch["mask"].to(device, non_blocking=True)
         logits = model(H, M)
+        if gammas is not None:
+            for j, t in enumerate(TASKS):
+                valid = M & (Y[:, :, j] > -50)
+                loss_sums[t] += float(asymmetric_focal_loss(
+                    logits[t], Y[:, :, j], valid, gammas["gamma_pos"][t], gammas["gamma_neg"][t]))
+            n_batches += 1
+        probs = torch.stack([torch.sigmoid(logits[t]) for t in TASKS], dim=-1).float().cpu().numpy()
+        labels = Y.cpu().numpy()
+        lengths = M.sum(1).cpu().numpy()
+        for b, pid in enumerate(batch["ids"]):
+            L = int(lengths[b])
+            proteins[pid] = {"prob": probs[b, :L].astype(np.float32), "label": labels[b, :L].astype(np.int8)}
+    preds = {"tasks": list(TASKS), "proteins": proteins}
+    losses = {t: v / max(n_batches, 1) for t, v in loss_sums.items()} if gammas is not None else None
+    return preds, losses
 
-        loss_sum = 0.0
-        for j, name in enumerate(TASK_NAMES):
-            y = Y[:, :, j]
-            valid = M & (y > -50)  # 패딩 및 라벨 없는 위치 제외
 
-            loss = masked_bce_with_logits(logits[name], y, valid)
-            if cfg.use_focal:
-                loss = loss + focal_bce_with_logits(logits[name], y, valid, alpha=cfg.alphas[name])
-            if cfg.use_dice:
-                loss = loss + dice_loss(logits[name], y, valid)
-            loss_sum = loss_sum + loss
+def pooled(preds: dict, task: str, ids: Optional[Sequence[str]] = None):
+    """Pools residues of the given proteins (micro-averaging) for one task."""
+    j = preds["tasks"].index(task)
+    ids = list(preds["proteins"].keys()) if ids is None else ids
+    ys, ps = [], []
+    for pid in ids:
+        rec = preds["proteins"][pid]
+        y = rec["label"][:, j]
+        keep = y >= 0
+        ys.append(y[keep])
+        ps.append(rec["prob"][keep, j])
+    if not ys:
+        return np.array([]), np.array([])
+    return np.concatenate(ys).astype(np.int64), np.concatenate(ps).astype(np.float64)
 
-            if valid.any():
-                prob = torch.sigmoid(logits[name])[valid]
-                pred = (prob >= cfg.thresholds.get(name, 0.5)).float()
-                tgt = y[valid].float()
 
-                tp[j] += (pred * tgt).sum()
-                fp[j] += (pred * (1 - tgt)).sum()
-                fn[j] += ((1 - pred) * tgt).sum()
-                tn[j] += ((1 - pred) * (1 - tgt)).sum()
+def select_thresholds(preds: dict) -> Dict[str, float]:
+    """Threshold maximising F1 for each task (to be computed on the validation set)."""
+    return {t: best_f1_threshold(*pooled(preds, t))[1] for t in preds["tasks"]}
 
-                y_true_all[j].append(tgt.cpu().numpy())
-                y_prob_all[j].append(prob.cpu().numpy())
 
-        total_loss += loss_sum.item()
-        nsteps += 1
+def evaluate_predictions(preds: dict, thresholds: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+    return {t: compute_metrics(*pooled(preds, t), thresholds.get(t, 0.5)) for t in preds["tasks"]}
 
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-    y_true_cat = [np.concatenate(v) if v else np.array([]) for v in y_true_all]
-    y_prob_cat = [np.concatenate(v) if v else np.array([]) for v in y_prob_all]
+def mean_aupr(preds: dict) -> float:
+    vals = []
+    for t in preds["tasks"]:
+        y, p = pooled(preds, t)
+        if _has_both_classes(y):
+            vals.append(average_precision_score(y, p))
+    return float(np.mean(vals)) if vals else NAN
 
-    auc_list, thr_youden, thr_f1 = [], [], []
-    for y_true, y_prob in zip(y_true_cat, y_prob_cat):
-        if not _has_both_classes(y_true):
-            auc_list.append(NAN)
-            thr_youden.append(NAN)
-            thr_f1.append(NAN)
+
+def save_predictions(preds: dict, thresholds: Dict[str, float], path: str, method: str = "FlexBind"):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump({**preds, "thresholds": thresholds, "method": method}, f)
+
+
+def format_table(metrics: Dict[str, Dict[str, float]]) -> str:
+    lines = ["task      " + "".join(f"{m:>10}" for m in METRIC_NAMES)]
+    for t, m in metrics.items():
+        lines.append(f"{t:<10}" + "".join(f"{m[k]:>10.4f}" for k in METRIC_NAMES))
+    return "\n".join(lines)
+
+
+def plot_pr_curves(preds: dict, out_dir: str, suffix: str = ""):
+    """Optional PR-curve plots (requires matplotlib)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log("matplotlib not installed; skipping PR plots")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    for t in preds["tasks"]:
+        y, p = pooled(preds, t)
+        if not _has_both_classes(y):
             continue
+        P, R, _ = precision_recall_curve(y, p)
+        plt.figure(figsize=(5, 5))
+        plt.plot(R, P, label=f"AUPR={average_precision_score(y, p):.4f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"PR curve - {t}")
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"pr_{t}{suffix}.png"), dpi=200)
+        plt.close()
 
-        auc_list.append(float(roc_auc_score(y_true, y_prob)))
 
-        fpr, tpr, thr = roc_curve(y_true, y_prob)
-        thr_youden.append(float(thr[np.argmax(tpr - fpr)]))
+# --------------------------------------------------------------------------- #
+# Checkpoints
+# --------------------------------------------------------------------------- #
+def load_flexbind(checkpoint_path: str, device, model_cfg: Optional[dict] = None):
+    """Loads a FlexBind checkpoint written by scripts/train.py (or a bare state_dict)."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        cfg = ckpt.get("model_config", model_cfg or {})
+        state, thresholds = ckpt["model_state"], ckpt.get("thresholds")
+    else:
+        cfg, state, thresholds = (model_cfg or {}), ckpt, None
+    model = FlexBind(**cfg).to(device)
+    model.load_state_dict(state)
+    model.eval()
+    return model, thresholds
 
-        thr_f1.append(_best_f1(*precision_recall_curve(y_true, y_prob))[1])
 
-    TP, FP, FN = (float(x[BINDING_IDX].sum()) for x in (tp, fp, fn))
+def main():
+    p = argparse.ArgumentParser(description="Evaluate a trained FlexBind checkpoint.")
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--npz_path", required=True)
+    p.add_argument("--disorder_txt", required=True)
+    p.add_argument("--protein_txt", required=True)
+    p.add_argument("--rna_txt", required=True)
+    p.add_argument("--dna_txt", required=True)
+    p.add_argument("--out_dir", default="./results")
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--plot", action="store_true")
+    args = p.parse_args()
 
-    return {
-        'loss': total_loss / max(nsteps, 1),
-        'precision': precision.tolist(),
-        'recall': recall.tolist(),
-        'f1': f1.tolist(),
-        'auc': auc_list,
-        'macro': {
-            'sensitivity': float(recall[BINDING_IDX].mean()),
-            'f1': float(f1[BINDING_IDX].mean()),
-        },
-        'micro': {
-            'sensitivity': TP / (TP + FN + 1e-8),
-            'f1': 2 * TP / (2 * TP + FP + FN + 1e-8),
-        },
-        'best_thr': thr_youden,
-        'best_thr_f1': thr_f1,
-        'confusion': {
-            'tp': tp.tolist(),
-            'fp': fp.tolist(),
-            'fn': fn.tolist(),
-            'tn': tn.tolist(),
-        },
-        'actual': {
-            'pos': (tp + fn).tolist(),
-            'neg': (tn + fp).tolist(),
-        },
-        'roc_raw': {'y_true': y_true_cat, 'y_prob': y_prob_cat},
-    }
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, thresholds = load_flexbind(args.checkpoint, device)
+    if thresholds is None:
+        log("Checkpoint has no validation thresholds; falling back to 0.5")
+        thresholds = {t: 0.5 for t in TASKS}
+
+    loader = build_loader(args.npz_path, {"disorder": args.disorder_txt, "protein": args.protein_txt,
+                                          "rna": args.rna_txt, "dna": args.dna_txt},
+                          batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    preds, _ = collect_predictions(model, loader, device)
+    metrics = evaluate_predictions(preds, thresholds)
+    os.makedirs(args.out_dir, exist_ok=True)
+    save_predictions(preds, thresholds, os.path.join(args.out_dir, "predictions.pkl"))
+    with open(os.path.join(args.out_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    if args.plot:
+        plot_pr_curves(preds, args.out_dir)
+    print(format_table(metrics))
+
+
+if __name__ == "__main__":
+    main()
