@@ -164,8 +164,9 @@ class ResidueWiseScaleAttention(nn.Module):
         V = W_V(X)
         scores = torch.einsum("bld,blsd->bls", Q, K) / math.sqrt(self.d2)
         alpha = torch.softmax(scores, dim=-1)
-        # (1 - Mask_l) * (-inf): padded residues get zero weight on every scale
-        # (applied multiplicatively to avoid NaNs from an all -inf softmax row).
+        # alpha_{s,l} = Mask_l * softmax_s(scores): the softmax runs over the scale axis and
+        # the residue mask is applied multiplicatively, so padded residues get zero weight
+        # on every scale (an additive -inf mask would make the whole softmax row NaN).
         alpha = alpha * m.unsqueeze(-1)
         ctx = torch.einsum("bls,blsd->bld", alpha, V)               # (B, L, d2)
         return ctx, alpha
